@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# MMDetection / Training Outputs
+work_dirs/
+*.log
+*.pth
+*.pkl
+
+*.err
+*.out
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Git
+.git/
+
+# WandB
+wandb/
+
+# Data (if you accidentally put data in repo)
+data/
+*.jpg
+*.png
+*.raw
+*.npy
+
+# VSCode
+.vscode/
+
+# Other
+.DS_Store
+*.swp
+*.swo
+*~mmdetection/work_dirs/
+mmdetection/data/
+
+# Ignore a specific subfolder
+work_dirs_SmokeTests/
+

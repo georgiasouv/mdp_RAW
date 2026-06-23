@@ -1,0 +1,205 @@
+"""Gradient combiners -- how multiple detectors' gradients become ONE update
+to the shared preprocessor.
+
+The validity problem this solves:
+    With total = sum(L_i) and total.backward(), a detector whose loss (and
+    hence gradient) is 6x larger dominates the update by sheer MAGNITUDE,
+    not because it's more correct. Then a 'pair' regime is really 'the big
+    detector + a whisper of the small one', and you can't attribute results
+    to detector DIVERSITY vs gradient SCALE. Equalizing per-detector
+    gradient magnitude removes that confound.
+
+Each combiner takes the per-detector losses + the shared params, computes
+the combined gradient, and WRITES it into each param's .grad (so the caller
+just does optimizer.step() afterward -- no .backward() needed).
+
+    combine(method, losses, params) -> (grad_norms_before, info)
+
+Methods:
+    'sum'      : baseline. grad of sum(L_i). (== what total.backward() does.)
+    'normgrad' : per-detector grad -> normalize each to unit L2 -> average.
+                 Equalizes INFLUENCE (magnitude fix). The default.
+    'mgda'     : minimum-norm common-descent direction (Desideri 2012 /
+                 Sener & Koltun 2018). The theoretical baseline PCGrad and
+                 CAGrad generalize.
+    'pcgrad'   : project out conflicting gradient components (Yu et al. 2020).
+                 Direction fix.
+    'cagrad'   : conflict-averse update via a small constrained solve
+                 (Liu et al. 2021). Direction fix with convergence guarantee.
+"""
+import torch
+
+
+def _grads_for(loss, params, retain):
+    """d(loss)/d(params) as a list aligned with params (None -> zeros)."""
+    g = torch.autograd.grad(loss, params, retain_graph=retain,
+                            allow_unused=True)
+    return [gi if gi is not None else torch.zeros_like(p)
+            for gi, p in zip(g, params)]
+
+
+def _flat_norm(grad_list):
+    return torch.sqrt(sum((g * g).sum() for g in grad_list)) + 1e-12
+
+
+def _flatten(grad_list):
+    """Concatenate a per-parameter grad list into ONE flat vector."""
+    return torch.cat([g.reshape(-1) for g in grad_list])
+
+
+def _unflatten(flat, like):
+    """Split a flat vector back into the per-parameter shapes of `like`."""
+    out, i = [], 0
+    for p in like:
+        n = p.numel()
+        out.append(flat[i:i + n].view_as(p))
+        i += n
+    return out
+
+
+def _pcgrad_project(per, names, params):
+    """PCGrad (Yu et al. 2020): for each detector gradient g_i, project OUT
+    its conflicting component against every other detector's g_j (only when
+    they conflict, i.e. dot < 0). Returns the combined per-parameter list.
+
+    Operates on FLATTENED vectors because the projection needs dot products
+    across all params at once. Order of the j-loop is randomized per the
+    paper to avoid bias from a fixed projection order."""
+    import random
+    flats = {name: _flatten(per[name]) for name in names}
+    projected = {}
+    for name in names:
+        g_i = flats[name].clone()
+        others = [n for n in names if n != name]
+        random.shuffle(others)                 # paper: random projection order
+        for other in others:
+            g_j = flats[other]
+            dot = torch.dot(g_i, g_j)
+            if dot < 0:                        # conflict -> remove component
+                g_i = g_i - (dot / (g_j * g_j).sum().clamp_min(1e-12)) * g_j
+        projected[name] = g_i
+    # PCGrad combines the projected gradients by SUMMING them
+    combined_flat = sum(projected[name] for name in names)
+    return _unflatten(combined_flat, params)
+
+
+def _mgda_solve(per, names, params):
+    """MGDA (Desideri 2012 / Sener & Koltun 2018): find the minimum-norm
+    vector in the convex hull of the detector gradients. Solve for weights w
+    on the simplex minimizing ||G^T w||^2 = w^T GG w, then the update is the
+    weighted combination Gw itself. This is the common-descent direction that
+    decreases every detector's loss; it is the theoretical baseline that both
+    PCGrad and CAGrad generalize (CAGrad reduces to MGDA at c=0 with the
+    average-gradient anchor dropped). Operates on FLATTENED gradients; the
+    solve is over n weights (n = number of detectors, 2-3), so cheap."""
+    import numpy as np
+    from scipy.optimize import minimize
+
+    n = len(names)
+    flats = [_flatten(per[name]) for name in names]      # each [P]
+    G = torch.stack(flats, dim=0)                        # [n, P]
+    GG = (G @ G.t()).cpu().double().numpy()              # [n, n] gram matrix
+
+    # minimize w^T GG w on the simplex (the min-norm point in the hull)
+    def obj(w):
+        return float(w @ GG @ w)
+
+    w0 = np.ones(n) / n
+    bounds = [(0.0, 1.0)] * n
+    cons = {'type': 'eq', 'fun': lambda w: w.sum() - 1.0}
+    sol = minimize(obj, w0, bounds=bounds, constraints=cons, method='SLSQP')
+    w = torch.tensor(sol.x, dtype=G.dtype, device=G.device)
+
+    # the MGDA update is the min-norm convex combination itself
+    d = (w.unsqueeze(0) @ G).squeeze(0)                  # [P]
+    return _unflatten(d, params)
+
+
+def _cagrad_solve(per, names, params, c=0.5):
+    """CAGrad (Liu et al. 2021): find an update vector that maximizes the
+    worst-case local improvement across detectors, within a ball of radius
+    c*||g0|| around the average gradient g0. Provably converges to a min of
+    the average loss; reduces to plain averaging at c=0.
+
+    Solves a small problem over w (one weight per detector, on the simplex)
+    with scipy SLSQP, using the gram matrix G G^T. Operates on FLATTENED
+    gradients. Dimension of the solve = number of detectors (2-3), so cheap."""
+    import numpy as np
+    from scipy.optimize import minimize
+
+    n = len(names)
+    flats = [_flatten(per[name]) for name in names]      # each [P]
+    G = torch.stack(flats, dim=0)                        # [n, P]
+    g0 = G.mean(dim=0)                                    # average gradient
+    GG = (G @ G.t()).cpu().double().numpy()              # [n, n] gram matrix
+    g0_norm = float(g0.norm().clamp_min(1e-12))
+    c_scaled = c * g0_norm
+
+    # objective over w on the simplex (official CAGrad form):
+    #   minimize  w^T GG (1/n)  +  c*||g0|| * sqrt(w^T GG w)
+    b = GG.mean(axis=1)                                   # GG @ (1/n)
+
+    def obj(w):
+        ww = float(w @ GG @ w)
+        return float(w @ b) + c_scaled * np.sqrt(max(ww, 1e-12))
+
+    w0 = np.ones(n) / n
+    bounds = [(0.0, 1.0)] * n
+    cons = {'type': 'eq', 'fun': lambda w: w.sum() - 1.0}
+    sol = minimize(obj, w0, bounds=bounds, constraints=cons, method='SLSQP')
+    w = torch.tensor(sol.x, dtype=G.dtype, device=G.device)
+
+    # construct the CAGrad update: g0 + (c*||g0|| / ||Gw||) * Gw
+    gw = (w.unsqueeze(0) @ G).squeeze(0)                  # weighted combo [P]
+    gw_norm = float(gw.norm().clamp_min(1e-12))
+    d = g0 + (c_scaled / gw_norm) * gw
+    return _unflatten(d, params)
+
+
+def combine(method, losses: dict, params):
+    """Compute combined gradient and write into params' .grad.
+
+    losses : {name: scalar loss tensor (requires grad)}
+    params : list of preprocessor parameters
+    Returns (grad_norms, info) where grad_norms[name] = ||grad_name|| (the
+    pre-combination magnitudes, for logging the scale problem).
+    """
+    params = [p for p in params if p.requires_grad]
+    names = list(losses.keys())
+
+    # single detector: nothing to balance, just the normal gradient
+    if len(names) == 1:
+        g = _grads_for(losses[names[0]], params, retain=False)
+        for p, gi in zip(params, g):
+            p.grad = gi
+        return {names[0]: float(_flat_norm(g))}, {'method': 'single'}
+
+    # multiple: get each detector's gradient separately (retain until last)
+    per = {}
+    for idx, name in enumerate(names):
+        per[name] = _grads_for(losses[name], params,
+                               retain=(idx < len(names) - 1))
+    grad_norms = {name: float(_flat_norm(per[name])) for name in names}
+
+    if method == 'sum':
+        combined = [sum(per[name][i] for name in names)
+                    for i in range(len(params))]
+    elif method == 'normgrad':
+        normed = {}
+        for name in names:
+            n = _flat_norm(per[name])
+            normed[name] = [g / n for g in per[name]]
+        combined = [sum(normed[name][i] for name in names) / len(names)
+                    for i in range(len(params))]
+    elif method == 'mgda':
+        combined = _mgda_solve(per, names, params)
+    elif method == 'pcgrad':
+        combined = _pcgrad_project(per, names, params)
+    elif method == 'cagrad':
+        combined = _cagrad_solve(per, names, params)
+    else:
+        raise ValueError(f'unknown combine method: {method}')
+
+    for p, gi in zip(params, combined):
+        p.grad = gi
+    return grad_norms, {'method': method}

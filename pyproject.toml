@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdp"
+version = "0.1.0"
+description = "Learnable RAW preprocessing supervised by multiple frozen detectors"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+# top-level-rooted: the project root IS the package container. List the
+# subpackages explicitly so setuptools maps them under the install.
+packages = ["core", "datasets", "dataprep", "results", "dev"]

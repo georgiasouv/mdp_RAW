@@ -1,0 +1,93 @@
+"""Gradient combiners -- how multiple detectors' gradients become ONE update
+to the shared preprocessor.
+
+The validity problem this solves:
+    With total = sum(L_i) and total.backward(), a detector whose loss (and
+    hence gradient) is 6x larger dominates the update by sheer MAGNITUDE,
+    not because it's more correct. Then a 'pair' regime is really 'the big
+    detector + a whisper of the small one', and you can't attribute results
+    to detector DIVERSITY vs gradient SCALE. Equalizing per-detector
+    gradient magnitude removes that confound.
+
+Each combiner takes the per-detector losses + the shared params, computes
+the combined gradient, and WRITES it into each param's .grad (so the caller
+just does optimizer.step() afterward -- no .backward() needed).
+
+    combine(method, losses, params) -> (grad_norms_before, info)
+
+Methods:
+    'sum'      : baseline. grad of sum(L_i). (== what total.backward() does.)
+                 Keep this for the ABLATION -- you must show sum vs normalized.
+    'normgrad' : per-detector grad -> normalize each to unit L2 -> average.
+                 Equalizes INFLUENCE. The validity fix / new default.
+    'pcgrad'   : (stub, raises) -- direction fix, the research extension.
+
+Why normalize the GRADIENT not the LOSS: two detectors with identical loss
+values can still have different gradient norms w.r.t. the preprocessor.
+Magnitude of influence is set by the gradient, so that's what we equalize.
+"""
+import torch
+
+
+def _grads_for(loss, params, retain):
+    """d(loss)/d(params) as a list aligned with params (None -> zeros)."""
+    g = torch.autograd.grad(loss, params, retain_graph=retain,
+                            allow_unused=True)
+    return [gi if gi is not None else torch.zeros_like(p)
+            for gi, p in zip(g, params)]
+
+
+def _flat_norm(grad_list):
+    return torch.sqrt(sum((g * g).sum() for g in grad_list)) + 1e-12
+
+
+def combine(method, losses: dict, params):
+    """Compute combined gradient and write into params' .grad.
+
+    losses : {name: scalar loss tensor (requires grad)}
+    params : list of preprocessor parameters
+    Returns (grad_norms, info) where grad_norms[name] = ||grad_name|| (the
+    pre-combination magnitudes, for logging the scale problem).
+    """
+    params = [p for p in params if p.requires_grad]
+    names = list(losses.keys())
+
+    # single detector: nothing to balance, just the normal gradient
+    if len(names) == 1:
+        g = _grads_for(losses[names[0]], params, retain=False)
+        for p, gi in zip(params, g):
+            p.grad = gi
+        return {names[0]: float(_flat_norm(g))}, {'method': 'single'}
+
+    # multiple: get each detector's gradient separately (retain graph until last)
+    per = {}
+    for idx, name in enumerate(names):
+        per[name] = _grads_for(losses[name], params,
+                               retain=(idx < len(names) - 1))
+    grad_norms = {name: float(_flat_norm(per[name])) for name in names}
+
+    if method == 'sum':
+        # baseline: just add them (what total.backward() does)
+        combined = [sum(per[name][i] for name in names)
+                    for i in range(len(params))]
+
+    elif method == 'normgrad':
+        # normalize each detector's gradient to unit norm, then average.
+        # => each detector contributes EQUAL magnitude to the update.
+        normed = {}
+        for name in names:
+            n = _flat_norm(per[name])
+            normed[name] = [g / n for g in per[name]]
+        combined = [sum(normed[name][i] for name in names) / len(names)
+                    for i in range(len(params))]
+
+    elif method == 'pcgrad':
+        raise NotImplementedError(
+            'pcgrad is the direction-conflict extension; implement after '
+            'normgrad validity fix is established.')
+    else:
+        raise ValueError(f'unknown combine method: {method}')
+
+    for p, gi in zip(params, combined):
+        p.grad = gi
+    return grad_norms, {'method': method}

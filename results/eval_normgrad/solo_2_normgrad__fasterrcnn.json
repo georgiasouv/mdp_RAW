@@ -1,0 +1,9 @@
+{
+  "map": 0.46028658747673035,
+  "map_50": 0.9338840246200562,
+  "map_75": 0.3547315001487732,
+  "regime": "solo_2",
+  "detector": "fasterrcnn",
+  "dataset": "pascalraw",
+  "split": "test"
+}

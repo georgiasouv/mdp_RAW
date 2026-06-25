@@ -1,0 +1,9 @@
+{
+  "map": 0.451826810836792,
+  "map_50": 0.9019010066986084,
+  "map_75": 0.3266289532184601,
+  "regime": "pair_T2",
+  "detector": "retinanet",
+  "dataset": "pascalraw",
+  "split": "test"
+}

@@ -34,7 +34,8 @@ python -m core.train \
     --dataset pascalraw \
     --num-classes 3 \
     --combine normgrad \
-    --epochs 50 \
+    --resume "$OUT/preprocessor.pth" \
+    --epochs 80 \
     --bs 4 \
     --val-every 1 \
     --val-max-batches 50 \

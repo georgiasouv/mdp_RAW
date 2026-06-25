@@ -1,0 +1,9 @@
+{
+  "map": 0.07786444574594498,
+  "map_50": 0.14668911695480347,
+  "map_75": 0.0744348093867302,
+  "regime": "solo_1",
+  "detector": "fasterrcnn",
+  "dataset": "rod",
+  "split": "test"
+}

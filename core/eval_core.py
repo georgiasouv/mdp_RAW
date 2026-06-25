@@ -78,7 +78,8 @@ def predict_fn_for(detector_name):
 
 
 @torch.no_grad()
-def evaluate_map(prep, det_model, detector_name, dl, device, class_map=None):
+def evaluate_map(prep, det_model, detector_name, dl, device, class_map=None,
+                 class_names=None):
     """Run prep -> detector over a dataloader, return the FULL COCO metric dict
     (map, map_50, map_75, map_small/medium/large, mar_*). See COCO_METRIC_KEYS.
 
@@ -89,15 +90,23 @@ def evaluate_map(prep, det_model, detector_name, dl, device, class_map=None):
     class_map   : local_id -> detector_id (from registry.get_class_map). Its
                   inverse is applied to predictions so they score against LOCAL
                   GT. None = predictions already in local id space.
+    class_names : optional {local_id: name} for labelling per-class AP in the
+                  output. None -> per-class rows are labelled by integer id.
     Restores BOTH prep and det_model to their prior train/eval mode on exit.
     Critical: torchvision detectors return a loss dict in train mode but
     predictions in eval mode, so leaving the detector in eval would crash
     the next training step (sum(predictions.values()) -> AttributeError).
+
+    Per-class AP: the metric is built with class_metrics=True so torchmetrics
+    returns map_per_class + the matching classes tensor. We surface those as
+    res['map_per_class'] (list[float]) and res['classes'] (list[int]), so a
+    shared-preprocessor regime that helps one class at another's expense is
+    visible rather than hidden inside the pooled mean.
     """
     prep_was_training = prep.training
     det_was_training = det_model.training
     prep.eval()
-    metric = MeanAveragePrecision(box_format='xyxy')
+    metric = MeanAveragePrecision(box_format='xyxy', class_metrics=True)
     predict = predict_fn_for(detector_name)
     for raw, targets in dl:
         raw = raw.to(device)
@@ -113,6 +122,17 @@ def evaluate_map(prep, det_model, detector_name, dl, device, class_map=None):
     # keep the full COCO breakdown; cast tensors to float (some are -1 when a
     # size bucket has no GT objects -- COCO's "not applicable" sentinel).
     res = {k: float(computed[k]) for k in COCO_METRIC_KEYS if k in computed}
+    # per-class AP: torchmetrics returns map_per_class (one AP per class seen)
+    # and classes (the matching local ids, since preds/GT are in local space).
+    # With a single class present these can be 0-dim scalars, so normalise to
+    # lists. classes are ints (the local dataset ids).
+    if 'map_per_class' in computed and 'classes' in computed:
+        per = computed['map_per_class']
+        cls = computed['classes']
+        res['map_per_class'] = [float(x) for x in per.reshape(-1)]
+        res['classes'] = [int(x) for x in cls.reshape(-1)]
+        if class_names is not None:
+            res['class_names'] = [class_names.get(c, str(c)) for c in res['classes']]
     # restore prior modes -- probe must not alter training state
     if prep_was_training:
         prep.train()
@@ -124,6 +144,8 @@ def evaluate_map(prep, det_model, detector_name, dl, device, class_map=None):
 def format_coco_table(metrics, indent='    '):
     """Render a metrics dict as a compact YOLO/MMDetection-style table string.
     Values of -1 (size bucket absent in this split) are shown as 'n/a'.
+    If per-class AP is present (map_per_class), a per-class line is appended,
+    labelled by class_names when available else by integer class id.
     """
     def fmt(k):
         v = metrics.get(k)
@@ -143,4 +165,17 @@ def format_coco_table(metrics, indent='    '):
         f"{indent}{'AR by size:':>14} small={fmt('mar_small')}  "
         f"medium={fmt('mar_medium')}  large={fmt('mar_large')}",
     ]
+
+    # per-class AP line (only if computed). Labels come from class_names if the
+    # caller passed them through evaluate_map, else fall back to integer ids.
+    per = metrics.get('map_per_class')
+    if per is not None:
+        names = metrics.get('class_names')
+        ids = metrics.get('classes', list(range(len(per))))
+        labels = names if names is not None else [str(i) for i in ids]
+        parts = '  '.join(
+            f"{lab}={(' n/a ' if v < 0 else f'{v:.4f}')}"
+            for lab, v in zip(labels, per)
+        )
+        lines.append(f"{indent}{'per class:':>14} {parts}")
     return '\n'.join(lines)

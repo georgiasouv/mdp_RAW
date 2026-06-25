@@ -115,8 +115,9 @@ def main():
 
     from datasets.registry import build_records
     train_records, val_records, load_fn = build_records(args.dataset)
-    from datasets.registry import get_class_map
+    from datasets.registry import get_class_map, get_class_names
     class_map = get_class_map(args.dataset)
+    class_names = get_class_names(args.dataset)
     print(f'[train] class_map for {args.dataset}: {class_map}', flush=True)
     ds = RawDetectionDataset(train_records, load_fn, size=(args.size, args.size))
     dl = DataLoader(ds, batch_size=args.bs, shuffle=True, num_workers=8,
@@ -259,7 +260,7 @@ def main():
                 if use_wandb:
                     # log every COCO metric so all curves are in wandb
                     wandb.log({f'val_probe/{name}/{k}': v for k, v in m.items()
-                               if v is not None and v >= 0}, step=step)
+                               if v is not None and isinstance(v, (int, float)) and v >= 0}, step=step)
                     wandb.log({'epoch': epoch + 1}, step=step)
 
     with open(os.path.join(args.out, 'conflict_log.json'), 'w') as f:

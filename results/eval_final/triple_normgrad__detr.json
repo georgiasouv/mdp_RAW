@@ -1,0 +1,9 @@
+{
+  "map": 0.456004798412323,
+  "map_50": 0.8805685639381409,
+  "map_75": 0.40370380878448486,
+  "regime": "triple",
+  "detector": "detr",
+  "dataset": "pascalraw",
+  "split": "test"
+}

@@ -1,0 +1,9 @@
+{
+  "map": 0.4030396044254303,
+  "map_50": 0.8252636790275574,
+  "map_75": 0.28607985377311707,
+  "regime": "pair_T2",
+  "detector": "fcos",
+  "dataset": "pascalraw",
+  "split": "test"
+}

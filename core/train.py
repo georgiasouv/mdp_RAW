@@ -217,6 +217,7 @@ def main():
             # then step. No total.backward() -- combine() did the differentiation.
             opt.zero_grad()
             grad_norms, _ = combine(args.combine, losses, list(prep.parameters()))
+            torch.nn.utils.clip_grad_norm_(prep.parameters(), max_norm=0.1)
             opt.step()
             step += 1
 

@@ -1,7 +1,0 @@
-name: rawdet
-channels:
-  - https://repo.anaconda.com/pkgs/main
-  - https://repo.anaconda.com/pkgs/r
-dependencies:
-  - python=3.11
-prefix: /home/souval_g_WMGDS.WMG.WARWICK.AC.UK/anaconda3/envs/rawdet
